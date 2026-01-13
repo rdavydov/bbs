@@ -138,27 +138,124 @@ try:
     mistuneRenderer = mistune.HTMLRenderer
 except AttributeError:
     mistuneRenderer = mistune.Renderer
+
 # Custom mistune.Renderer that stores a list of all links encountered.
 class LinkExtractionRenderer(mistuneRenderer):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+        # Pass kwargs through to parent renderer initializer (compatible w/ v1/v2)
+        try:
+            super().__init__(**kwargs)
+        except TypeError:
+            # Some mistune renderers accept no kwargs; fall back.
+            super().__init__()
+
         self.links = []
 
-    def autolink(self, link, is_email=False):
-        self.links.append(link)
-        return super().autolink(link, is_email)
+    def _maybe_call_parent(self, func_name, *args, **kwargs):
+        """
+        Try calling parent implementation in a few calling conventions to
+        maximize compatibility across mistune versions.
+        Returns the parent's return value or "" on failure.
+        """
+        # Get the bound method on the parent, if any.
+        parent = super()
+        func = getattr(parent, func_name, None)
+        if func is None:
+            return ""
+        # Try several call styles to cope with different signature expectations.
+        try:
+            return func(*args, **kwargs)
+        except TypeError:
+            # Try without kwargs
+            try:
+                return func(*args)
+            except TypeError:
+                # Try with a single positional arg if available
+                try:
+                    if len(args) >= 1:
+                        return func(args[0])
+                except Exception:
+                    pass
+        except Exception:
+            # If parent raises something else, let it propagate
+            raise
+        return ""
 
-    def image(self, src, title, alt_text):
-        self.links.append(src)
-        return super().image(src, title, alt_text)
+    def autolink(self, *args, **kwargs):
+        # Common autolink signatures vary; try to find the URL.
+        url = None
+        # mistune v2 sometimes passes link as first positional arg
+        if len(args) >= 1:
+            url = args[0]
+        # older versions may pass name 'link' or 'url'
+        if url is None:
+            url = kwargs.get("link") or kwargs.get("url")
+        if url:
+            self.links.append(url)
+        return self._maybe_call_parent("autolink", *args, **kwargs)
 
-    def link(self, link, title, content=None):
-        self.links.append(link)
-        return super().link(link, title, content)
+    def image(self, *args, **kwargs):
+        # image may be called as (src, title, alt) or with keywords.
+        src = kwargs.get("src")
+        if not src and len(args) >= 1:
+            src = args[0]
+        if src:
+            self.links.append(src)
+        return self._maybe_call_parent("image", *args, **kwargs)
+
+    def link(self, *args, **kwargs):
+        # link may be called with various names: (link, title, content) or (text, url=..., title=...)
+        url = kwargs.get("url") or kwargs.get("link")
+        if not url:
+            # try typical positions: first arg often is url/text depending on API
+            if len(args) >= 1:
+                # Some APIs provide (link, title, content) others (text, url, title)
+                # Try to heuristically pick the URL-like entry.
+                candidate = args[0]
+                # If first arg looks like a URL (starts with http or /), use it.
+                if isinstance(candidate, str) and (candidate.startswith("http://") or candidate.startswith("https://") or candidate.startswith("/")):
+                    url = candidate
+                elif len(args) >= 2 and isinstance(args[1], str):
+                    url = args[1]
+            elif len(args) >= 2:
+                url = args[1]
+        if url:
+            self.links.append(url)
+        return self._maybe_call_parent("link", *args, **kwargs)
 
 def markdown_extract_links(markdown):
+    """
+    Render markdown using a LinkExtractionRenderer and return collected links.
+    Compatible with mistune v1 and v2.
+    """
     renderer = LinkExtractionRenderer()
-    mistune.Markdown(renderer=renderer)(markdown) # Discard HTML output.
+    # mistune v2 provides create_markdown(), v1 uses Markdown(...)
+    try:
+        if hasattr(mistune, "create_markdown"):
+            # mistune v2
+            # create_markdown accepts renderer=renderer
+            md = mistune.create_markdown(renderer=renderer)
+        else:
+            # mistune v1
+            md = mistune.Markdown(renderer=renderer)
+    except TypeError:
+        # Fallback in case of unexpected signature differences
+        try:
+            md = mistune.Markdown(renderer=renderer)
+        except Exception:
+            md = None
+
+    if md is None:
+        # Something is very wrong; return empty list to avoid crashing the backup.
+        return []
+
+    # Render (we discard HTML output; renderer collects links)
+    try:
+        md(markdown)
+    except Exception:
+        # If rendering fails for some markdown input, ignore and return whatever was collected.
+        pass
+
     return renderer.links
 
 # Return seq with prefix stripped if it has such a prefix, or else None.
